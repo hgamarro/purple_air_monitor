@@ -194,7 +194,7 @@ if not df_map.empty:
         "style": {"backgroundColor":"steelblue","color":"white"}
     }
     deck = pdk.Deck(
-        map_style="mapbox://styles/mapbox/light-v9",
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
         initial_view_state=st.session_state.view_state,
         layers=[layer],
         tooltip=tooltip

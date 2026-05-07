@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import pydeck as pdk
 from datetime import datetime, timezone
+from pathlib import Path
 
 # streamlit run streamlit_app.py    
 # --- App Configuration ---
@@ -24,12 +25,7 @@ The app will display each sensor’s operational status on a map and in a detail
 """)
 
 # --- Sensor and API Configuration ---
-SENSOR_INDICES = [
-    270898, 279253, 279251, 133435, 155503, 155501, 155521, 155533,
-    155537, 155567, 155569, 155591, 155595, 155597, 155601, 155607,
-    155605, 155613, 155629, 155639, 155673, 155679, 155691, 162991,
-    163031, 163169
-]
+SENSOR_CSV_PATH = Path("sensors.csv")
 API_BASE_URL = "https://api.purpleair.com/v1/sensors/"
 FIELDS_TO_REQUEST = (
     "name,model,hardware,last_seen,confidence,rssi,uptime,"
@@ -44,6 +40,32 @@ STATUS_COLORS = {
     'low_confidence': [255, 255, 0, 160],
     'offline':        [255, 0, 0, 160],
 }
+
+def load_sensor_indices(csv_path=SENSOR_CSV_PATH):
+    """Load PurpleAir sensor indices from a CSV maintained outside the code."""
+    if not csv_path.exists():
+        st.error(f"Missing sensor configuration file: {csv_path}")
+        return []
+
+    try:
+        sensors_df = pd.read_csv(csv_path)
+    except Exception as exc:
+        st.error(f"Could not read {csv_path}: {exc}")
+        return []
+
+    if "sensor_index" not in sensors_df.columns:
+        st.error(f"{csv_path} must include a 'sensor_index' column.")
+        return []
+
+    sensor_indices = pd.to_numeric(
+        sensors_df["sensor_index"],
+        errors="coerce"
+    ).dropna().astype(int).drop_duplicates().tolist()
+
+    if not sensor_indices:
+        st.error(f"{csv_path} does not contain any valid sensor indices.")
+
+    return sensor_indices
 
 def get_sensor_data(api_key, sensor_index):
     """Fetch a single sensor’s data and assign status & color."""
@@ -101,9 +123,15 @@ def do_refresh():
     """Fetch all sensor data (with spinner) and store in session state."""
     with st.spinner("Fetching sensor data... Please wait."):
         api_key = st.secrets["textkey"]
+        sensor_indices = load_sensor_indices()
+        if not sensor_indices:
+            st.session_state.df = pd.DataFrame()
+            st.session_state.df_map = pd.DataFrame()
+            return
+
         records = [
             get_sensor_data(api_key, idx)
-            for idx in SENSOR_INDICES
+            for idx in sensor_indices
         ]
         df = pd.DataFrame(records)
         st.session_state.df     = df

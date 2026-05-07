@@ -26,6 +26,7 @@ The app will display each sensor’s operational status on a map and in a detail
 
 # --- Sensor and API Configuration ---
 SENSOR_CSV_PATH = Path("sensors.csv")
+SENSOR_CSV_URL_SECRET = "sensor_csv_url"
 API_BASE_URL = "https://api.purpleair.com/v1/sensors/"
 FIELDS_TO_REQUEST = (
     "name,model,hardware,last_seen,confidence,rssi,uptime,"
@@ -41,31 +42,82 @@ STATUS_COLORS = {
     'offline':        [255, 0, 0, 160],
 }
 
-def load_sensor_indices(csv_path=SENSOR_CSV_PATH):
-    """Load PurpleAir sensor indices from a CSV maintained outside the code."""
+def extract_sensor_registry(sensors_df, source_name):
+    """Validate a sensor table and return community-maintained sensor metadata."""
+    if "sensor_index" not in sensors_df.columns:
+        st.error(f"{source_name} must include a 'sensor_index' column.")
+        return pd.DataFrame()
+
+    sensors_df = sensors_df.copy()
+    sensors_df["sensor_index"] = pd.to_numeric(
+        sensors_df["sensor_index"],
+        errors="coerce"
+    )
+    sensors_df = sensors_df.dropna(subset=["sensor_index"])
+    sensors_df["sensor_index"] = sensors_df["sensor_index"].astype(int)
+    sensors_df = sensors_df.drop_duplicates(subset=["sensor_index"])
+
+    if "name" in sensors_df.columns:
+        sensors_df = sensors_df.rename(columns={"name": "community_name"})
+
+    optional_columns = ["community_name", "location", "notes"]
+    for column in optional_columns:
+        if column not in sensors_df.columns:
+            sensors_df[column] = ""
+
+    registry_columns = ["sensor_index", *optional_columns]
+    sensor_registry = sensors_df[registry_columns]
+
+    if sensor_registry.empty:
+        st.error(f"{source_name} does not contain any valid sensor indices.")
+
+    return sensor_registry
+
+def load_local_sensor_registry(csv_path=SENSOR_CSV_PATH):
+    """Load the checked-in CSV backup."""
     if not csv_path.exists():
-        st.error(f"Missing sensor configuration file: {csv_path}")
-        return []
+        st.error(f"Missing backup sensor configuration file: {csv_path}")
+        return pd.DataFrame()
 
     try:
         sensors_df = pd.read_csv(csv_path)
     except Exception as exc:
-        st.error(f"Could not read {csv_path}: {exc}")
-        return []
+        st.error(f"Could not read backup sensor CSV {csv_path}: {exc}")
+        return pd.DataFrame()
 
-    if "sensor_index" not in sensors_df.columns:
-        st.error(f"{csv_path} must include a 'sensor_index' column.")
-        return []
+    return extract_sensor_registry(sensors_df, str(csv_path))
 
-    sensor_indices = pd.to_numeric(
-        sensors_df["sensor_index"],
-        errors="coerce"
-    ).dropna().astype(int).drop_duplicates().tolist()
+def load_sensor_registry():
+    """Load sensors from Google Sheets CSV URL, falling back to local CSV."""
+    sensor_csv_url = st.secrets.get(SENSOR_CSV_URL_SECRET)
+    if sensor_csv_url:
+        try:
+            sensors_df = pd.read_csv(sensor_csv_url)
+            sensor_registry = extract_sensor_registry(
+                sensors_df,
+                "Google Sheet sensor CSV"
+            )
+            if not sensor_registry.empty:
+                return sensor_registry
+        except Exception as exc:
+            st.warning(
+                "Could not load Google Sheet sensor CSV. "
+                f"Using local backup instead. Error: {exc}"
+            )
 
-    if not sensor_indices:
-        st.error(f"{csv_path} does not contain any valid sensor indices.")
+    return load_local_sensor_registry()
 
-    return sensor_indices
+def merge_sensor_metadata(sensor_data, sensor_row):
+    """Attach community-maintained sheet fields to PurpleAir API results."""
+    for column in ["community_name", "location", "notes"]:
+        value = sensor_row.get(column, "")
+        if pd.notna(value) and str(value).strip():
+            sensor_data[column] = str(value).strip()
+
+    api_name = sensor_data.get("name", "")
+    community_name = sensor_data.get("community_name", "")
+    sensor_data["display_name"] = community_name or api_name
+    return sensor_data
 
 def get_sensor_data(api_key, sensor_index):
     """Fetch a single sensor’s data and assign status & color."""
@@ -123,15 +175,18 @@ def do_refresh():
     """Fetch all sensor data (with spinner) and store in session state."""
     with st.spinner("Fetching sensor data... Please wait."):
         api_key = st.secrets["textkey"]
-        sensor_indices = load_sensor_indices()
-        if not sensor_indices:
+        sensor_registry = load_sensor_registry()
+        if sensor_registry.empty:
             st.session_state.df = pd.DataFrame()
             st.session_state.df_map = pd.DataFrame()
             return
 
         records = [
-            get_sensor_data(api_key, idx)
-            for idx in sensor_indices
+            merge_sensor_metadata(
+                get_sensor_data(api_key, row["sensor_index"]),
+                row
+            )
+            for _, row in sensor_registry.iterrows()
         ]
         df = pd.DataFrame(records)
         st.session_state.df     = df
@@ -171,9 +226,12 @@ if not df.empty:
 
     # 3. Rename for display
     display_cols = {
+        'display_name':     'Name',
         'sensor_index':     'Sensor ID',
         'status':           'Status',
-        'name':             'Name',
+        'name':             'PurpleAir Name',
+        'location':         'Location',
+        'notes':            'Notes',
         'minutes_since_seen':'Mins Ago',
         'confidence':       'Confidence (%)',
         'rssi':             'WiFi (RSSI)',
@@ -189,9 +247,9 @@ if not df.empty:
 
     # 4. Keep your original column order
     order = [c for c in [
-        'Status', 'Sensor ID', 'Name', 'Mins Ago', 'Confidence (%)',
+        'Name', 'Sensor ID', 'Status', 'Location', 'Notes', 'Mins Ago', 'Confidence (%)',
         'WiFi (RSSI)', 'Uptime (min)', 'PM2.5', 'PM2.5 (60m avg)',
-        'Temp (°F)', 'Model', 'Lat', 'Lon'
+        'Temp (°F)', 'PurpleAir Name', 'Model', 'Lat', 'Lon'
     ] if c in df_disp.columns]
 
     # 5. Display the sorted table

@@ -77,15 +77,15 @@ def load_local_sensor_registry(csv_path=SENSOR_CSV_PATH):
     """Load the checked-in CSV backup."""
     if not csv_path.exists():
         st.error(f"Missing backup sensor configuration file: {csv_path}")
-        return pd.DataFrame()
+        return pd.DataFrame(), "missing local backup"
 
     try:
         sensors_df = pd.read_csv(csv_path)
     except Exception as exc:
         st.error(f"Could not read backup sensor CSV {csv_path}: {exc}")
-        return pd.DataFrame()
+        return pd.DataFrame(), "unreadable local backup"
 
-    return extract_sensor_registry(sensors_df, str(csv_path))
+    return extract_sensor_registry(sensors_df, str(csv_path)), f"local backup: {csv_path}"
 
 def load_sensor_registry():
     """Load sensors from Google Sheets CSV URL, falling back to local CSV."""
@@ -98,7 +98,7 @@ def load_sensor_registry():
                 "Google Sheet sensor CSV"
             )
             if not sensor_registry.empty:
-                return sensor_registry
+                return sensor_registry, "Google Sheet"
         except Exception as exc:
             st.warning(
                 "Could not load Google Sheet sensor CSV. "
@@ -118,6 +118,26 @@ def merge_sensor_metadata(sensor_data, sensor_row):
     community_name = sensor_data.get("community_name", "")
     sensor_data["display_name"] = community_name or api_name
     return sensor_data
+
+def get_map_dataframe(df):
+    """Return only rows that have usable map coordinates."""
+    location_columns = ["latitude", "longitude"]
+    if df.empty or not set(location_columns).issubset(df.columns):
+        return pd.DataFrame()
+
+    return df.dropna(subset=location_columns).copy()
+
+def get_error_sensor_record(sensor_index, status):
+    """Return a complete row shape for sensors that fail to fetch."""
+    return {
+        'sensor_index': sensor_index,
+        'status': status,
+        'name': 'N/A',
+        'last_seen': None,
+        'latitude': None,
+        'longitude': None,
+        'color': STATUS_COLORS['offline'],
+    }
 
 def get_sensor_data(api_key, sensor_index):
     """Fetch a single sensor’s data and assign status & color."""
@@ -151,11 +171,9 @@ def get_sensor_data(api_key, sensor_index):
         msg  = f"❌ HTTP {code}"
         if code == 403: msg += " (Invalid API Key?)"
         if code == 404: msg += " (Not Found)"
-        return {'sensor_index': sensor_index, 'status': msg, 'name': 'N/A',
-                'color': STATUS_COLORS['offline']}
+        return get_error_sensor_record(sensor_index, msg)
     except requests.exceptions.RequestException:
-        return {'sensor_index': sensor_index, 'status': '❌ Request Error',
-                'name': 'N/A', 'color': STATUS_COLORS['offline']}
+        return get_error_sensor_record(sensor_index, '❌ Request Error')
 
 # --- Default map view ---
 DEFAULT_VIEW = pdk.ViewState(
@@ -169,13 +187,17 @@ DEFAULT_VIEW = pdk.ViewState(
 if 'df'        not in st.session_state: st.session_state.df        = pd.DataFrame()
 if 'df_map'    not in st.session_state: st.session_state.df_map    = pd.DataFrame()
 if 'view_state' not in st.session_state: st.session_state.view_state = DEFAULT_VIEW
+if 'sensor_source' not in st.session_state: st.session_state.sensor_source = "not loaded yet"
+if 'sensor_count'  not in st.session_state: st.session_state.sensor_count  = 0
 
 # --- Callbacks ---
 def do_refresh():
     """Fetch all sensor data (with spinner) and store in session state."""
     with st.spinner("Fetching sensor data... Please wait."):
         api_key = st.secrets["textkey"]
-        sensor_registry = load_sensor_registry()
+        sensor_registry, sensor_source = load_sensor_registry()
+        st.session_state.sensor_source = sensor_source
+        st.session_state.sensor_count = len(sensor_registry)
         if sensor_registry.empty:
             st.session_state.df = pd.DataFrame()
             st.session_state.df_map = pd.DataFrame()
@@ -190,7 +212,7 @@ def do_refresh():
         ]
         df = pd.DataFrame(records)
         st.session_state.df     = df
-        st.session_state.df_map = df.dropna(subset=["latitude","longitude"]).copy()
+        st.session_state.df_map = get_map_dataframe(df)
     st.success("Finished fetching data!")
 
 def reset_view():
@@ -204,16 +226,25 @@ with col1:
 with col2:
     st.button("🔄 Reset Map View", on_click=reset_view)
 
+st.caption(
+    f"Sensor list source: {st.session_state.sensor_source} "
+    f"({st.session_state.sensor_count} sensors)"
+)
+
 # --- Display Table ---
 df = st.session_state.df
 if not df.empty:
     now_ts = datetime.now(timezone.utc).timestamp()
-    df['minutes_since_seen'] = df['last_seen'].apply(
-        lambda x: (now_ts - x)/60 if pd.notna(x) else None
-    )
+    if "last_seen" in df.columns:
+        df['minutes_since_seen'] = df['last_seen'].apply(
+            lambda x: (now_ts - x)/60 if pd.notna(x) else None
+        )
+    else:
+        df['minutes_since_seen'] = None
 
     # 1. Add a priority for sorting: red (❌)=0, yellow (⚠️)=1, green (✅)=2
     def status_priority(s):
+        s = str(s)
         if s.startswith('❌'): return 0
         if s.startswith('⚠️'): return 1
         if s.startswith('✅'): return 2
@@ -256,7 +287,7 @@ if not df.empty:
     st.subheader("Sensor Status Details")
     st.dataframe(
         df_disp[order],
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Mins Ago":     st.column_config.NumberColumn(format="%.1f"),
             "WiFi (RSSI)":  st.column_config.NumberColumn(format="%d dBm"),
@@ -276,7 +307,7 @@ if not df_map.empty:
         auto_highlight=True,
     )
     tooltip = {
-        "html": "<b>{name}</b><br/>ID: {sensor_index}<br/>Status: {status}",
+        "html": "<b>{display_name}</b><br/>ID: {sensor_index}<br/>Status: {status}",
         "style": {"backgroundColor":"steelblue","color":"white"}
     }
     deck = pdk.Deck(
@@ -285,7 +316,7 @@ if not df_map.empty:
         layers=[layer],
         tooltip=tooltip
     )
-    st.pydeck_chart(deck, use_container_width=True)
+    st.pydeck_chart(deck, width="stretch")
 
 elif df_map.empty and not df.empty:
     st.warning("No sensors with location data found.")

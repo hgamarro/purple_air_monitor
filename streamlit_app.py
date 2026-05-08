@@ -141,6 +141,7 @@ def get_error_sensor_record(sensor_index, status):
 
 def get_sensor_data(api_key, sensor_index):
     """Fetch a single sensor’s data and assign status & color."""
+    sensor_index = int(sensor_index)
     headers = {"X-API-Key": api_key}
     url = f"{API_BASE_URL}{sensor_index}?fields={FIELDS_TO_REQUEST}"
     try:
@@ -205,7 +206,7 @@ def do_refresh():
 
         records = [
             merge_sensor_metadata(
-                get_sensor_data(api_key, row["sensor_index"]),
+                get_sensor_data(api_key, int(row["sensor_index"])),
                 row
             )
             for _, row in sensor_registry.iterrows()
